@@ -25,6 +25,8 @@ pub enum StorageKey {
     EmergencyConfig,
     /// Persistent: approvals collected for a given invoice's emergency release.
     EmergencyApprovals(soroban_sdk::Symbol),
+    /// Persistent: pending two-admin settlement proposal by invoice id.
+    SettlementProposal(soroban_sdk::BytesN<32>),
     /// Instance: total count of escrows created for indexing.
     EscrowCount,
     /// Persistent: invoice_id indexed by sequential creation order.
@@ -43,6 +45,10 @@ pub enum StorageKey {
     InstallmentSchedule(soroban_sdk::Symbol),
     /// Instance: pending admin parameter change awaiting timelock expiry.
     PendingParamChange,
+    /// Persistent: secondary-market buy limit by invoice id.
+    BuyLimit(soroban_sdk::BytesN<32>),
+    /// Persistent: a wallet's current buy-limit window by (invoice_id, wallet).
+    BuyWindow(soroban_sdk::BytesN<32>, soroban_sdk::Address),
 }
 
 /// Registered invoice metadata and funding parameters stored in persistent storage.
@@ -79,6 +85,8 @@ pub struct Config {
     pub fee_bps: u32,
     /// Optional payment distributor contract used for settlement/refund fan-out.
     pub payment_distributor: Option<soroban_sdk::Address>,
+    /// Optional referral contract called on each investment to accrue referral fees.
+    pub referral_contract: Option<soroban_sdk::Address>,
     /// Emergency pause flag for lifecycle-changing operations.
     pub paused: bool,
     /// When true, `fund_escrow` requires the buyer to be on the whitelist.
@@ -193,6 +201,8 @@ pub struct EscrowData {
     pub due_dt: u64,
     /// Payment token contract address.
     pub token: soroban_sdk::Address,
+    /// Allowed payment tokens; the first contribution locks `token` to one of these.
+    pub accepted_tokens: soroban_sdk::Vec<soroban_sdk::Address>,
     /// Invoice token contract address (ownership/claim).
     pub inv_token: soroban_sdk::Address,
     /// Amount already paid by payer.
@@ -204,14 +214,35 @@ pub struct EscrowData {
     /// Commitment hash: immutable on-chain anchor for off-chain invoice data (PDF hash, ERP ID, etc.).
     /// Set at creation, cannot be modified. SHA-256 hash (32 bytes).
     pub commitment: soroban_sdk::BytesN<32>,
-    /// Optional early-settlement discount hook. If present, payments made before
-    /// `cutoff_date` receive a reduced effective face value.
-    pub early_settlement: Option<EarlySettlementConfig>,
+    /// Discount in basis points applied to `face_value` when payment is early.
+    /// `0` means the hook is not configured. A 0-bps discount is rejected by
+    /// `set_early_settlement` as a no-op, so 0 is unambiguous as "unset".
+    ///
+    /// Stored as two scalar fields rather than an
+    /// `Option<EarlySettlementConfig>` because soroban-sdk 27's
+    /// `#[contracttype]` derive cannot convert a nested custom struct inside an
+    /// `Option` — it emits an XDR conversion requiring
+    /// `From<EarlySettlementConfig> for ScVal`, which the derive never
+    /// generates. That made the type fail to build whenever the `testutils`
+    /// feature was unified in, which is what any consumer with a dev-dependency
+    /// on this crate ends up doing.
+    pub early_settlement_discount_bps: u32,
+    /// Ledger timestamp cutoff (exclusive) for the early-settlement discount.
+    /// Only meaningful when `early_settlement_discount_bps` is non-zero.
+    pub early_settlement_cutoff: u64,
     /// Commercial invoicing sector. Selects which `CategoryFeeSchedule` (if any)
     /// overrides `Config::fee_bps` for this escrow. Defaults to `Standard`.
     pub category: InvoiceCategory,
     /// Timestamp when escrow was fully funded (0 if not yet funded).
     pub funded_dt: u64,
+}
+
+/// A settlement awaiting approval from an admin other than its proposer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementProposal {
+    pub proposer: soroban_sdk::Address,
+    pub repayment_amount: i128,
 }
 
 /// Status for BytesN<32> funding invoices (position management).
@@ -243,6 +274,30 @@ pub struct FundingInvoice {
     pub status: InvoiceStatus,
     /// Payment token contract address.
     pub token: soroban_sdk::Address,
+    /// Minimum funding threshold: `release_to_issuer` only succeeds once
+    /// `total_raised` has reached this value.
+    pub min_funding_threshold: i128,
+    /// Maximum funding threshold: hard cap on `total_raised`. `invest` and
+    /// `top_up` reject amounts that would push the total above it.
+    pub max_funding_threshold: i128,
+    /// Whether `ThresholdReached` has already been emitted for this invoice.
+    /// Guarantees the event fires exactly once per invoice.
+    pub threshold_reached: bool,
+}
+
+/// Funding progress view returned by `get_funding_status`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingStatus {
+    /// Total amount raised so far across all investors.
+    pub raised: i128,
+    /// Minimum funding threshold configured for the invoice.
+    pub min_threshold: i128,
+    /// Maximum funding threshold configured for the invoice.
+    pub max_threshold: i128,
+    /// Percentage of the funding target filled, in basis points
+    /// (10_000 = 100%). Capped at 10_000 when the target is exceeded.
+    pub percent_filled_bps: u32,
 }
 /// Multi-signature configuration for emergency releases.
 #[contracttype]

@@ -1,15 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
+    "contracts/categorisation-registry",
+    "contracts/fee-treasury",
     "contracts/invoice-escrow",
     "contracts/invoice-token",
+    "contracts/nonce-registry",
+    "contracts/order-book",
+    "contracts/partial-settlement",
     "contracts/payment-distributor",
-    "contracts/fee-treasury",
-    "contracts/secondary-market-oracle",
-    "contracts/transfer-restriction",
-    "contracts/issuer-reputation",
-    "contracts/access-control-registry",
-    "contracts/maturity-enforcement",
+    "contracts/investment-limit",
+    "contracts/investor-notifications",
+    "contracts/yield-accrual",
+    "contracts/interest-rate-oracle",
+    "contracts/fraction-transfer-restriction",
 ]
 
 [workspace.dependencies]

@@ -1,45 +1,22 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+mod errors;
+mod events;
+mod types;
 
-const MAX_RECIPIENTS: u32 = 32;
+#[cfg(test)]
+mod test;
 
-#[derive(Clone)]
-#[contracttype]
-enum DataKey {
-    Config,
-    Balance,
-    Epoch,
-    Distribution(u64),
-}
+pub use errors::Error;
+use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env};
+pub use types::{DistributionRecord, SplitAmounts, SplitRatios, StorageKey};
 
-#[derive(Clone)]
-#[contracttype]
-struct Config {
-    admin: Address,
-    token: Address,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct DistributionRecord {
-    pub epoch: u64,
-    pub recipients: Vec<Address>,
-    pub amounts: Vec<i128>,
-    pub total: i128,
-}
-
-#[contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    InvalidAmount = 4,
-    InvalidRecipients = 5,
-    InsufficientBalance = 6,
-    Overflow = 7,
+fn default_ratios() -> SplitRatios {
+    SplitRatios {
+        protocol_bps: 5000,
+        issuer_bps: 3000,
+        lp_pool_bps: 2000,
+    }
 }
 
 #[contract]
@@ -47,118 +24,346 @@ pub struct FeeTreasury;
 
 #[contractimpl]
 impl FeeTreasury {
-    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Config) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        market_operator: Address,
+        token: Address,
+        protocol_recipient: Address,
+        lp_pool_recipient: Address,
+        ratios: Option<SplitRatios>,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&StorageKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        admin.require_auth();
+
+        let split = ratios.unwrap_or_else(default_ratios);
+        if split.protocol_bps + split.issuer_bps + split.lp_pool_bps != 10_000 {
+            return Err(Error::InvalidSplitRatios);
+        }
+
+        env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::Config, &Config { admin, token });
-        env.storage().instance().set(&DataKey::Balance, &0i128);
-        env.storage().instance().set(&DataKey::Epoch, &0u64);
+            .set(&StorageKey::MarketOperator, &market_operator);
+        env.storage().instance().set(&StorageKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ProtocolRecipient, &protocol_recipient);
+        env.storage()
+            .instance()
+            .set(&StorageKey::LpPoolRecipient, &lp_pool_recipient);
+        env.storage()
+            .instance()
+            .set(&StorageKey::SplitRatios, &split);
+
         Ok(())
     }
 
-    pub fn collect_fee(env: Env, source: Address, amount: i128) -> Result<(), Error> {
-        source.require_auth();
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let config: Config = env
+    pub fn set_market_operator(env: Env, new_operator: Address) -> Result<(), Error> {
+        let admin: Address = env
             .storage()
             .instance()
-            .get(&DataKey::Config)
+            .get(&StorageKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        soroban_sdk::token::Client::new(&env, &config.token).transfer(
-            &source,
-            &env.current_contract_address(),
-            &amount,
-        );
-        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::Balance,
-            &balance.checked_add(amount).ok_or(Error::Overflow)?,
-        );
-        env.events()
-            .publish((Symbol::new(&env, "FeeCollected"), source), amount);
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::MarketOperator, &new_operator);
         Ok(())
     }
 
-    pub fn get_balance(env: Env) -> Result<i128, Error> {
+    pub fn register_invoice_issuer(
+        env: Env,
+        invoice_id: BytesN<32>,
+        issuer: Address,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let operator: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MarketOperator)
+            .ok_or(Error::NotInitialized)?;
+
+        let caller = if env.storage().instance().has(&StorageKey::Admin) {
+            admin.clone()
+        } else {
+            operator.clone()
+        };
+        caller.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::InvoiceIssuer(invoice_id), &issuer);
+        Ok(())
+    }
+
+    pub fn update_split_ratios(env: Env, ratios: SplitRatios) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if ratios.protocol_bps + ratios.issuer_bps + ratios.lp_pool_bps != 10_000 {
+            return Err(Error::InvalidSplitRatios);
+        }
+
         env.storage()
             .instance()
-            .get(&DataKey::Balance)
+            .set(&StorageKey::SplitRatios, &ratios);
+        events::split_ratios_updated(
+            &env,
+            ratios.protocol_bps,
+            ratios.issuer_bps,
+            ratios.lp_pool_bps,
+        );
+
+        Ok(())
+    }
+
+    pub fn get_split_ratios(env: Env) -> Result<SplitRatios, Error> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SplitRatios)
             .ok_or(Error::NotInitialized)
     }
 
-    pub fn distribute(
+    pub fn collect_fee(
         env: Env,
-        recipients: Vec<Address>,
-        amounts: Vec<i128>,
-    ) -> Result<u64, Error> {
-        let config: Config = env
+        caller: Address,
+        invoice_id: BytesN<32>,
+        fee_amount: i128,
+    ) -> Result<SplitAmounts, Error> {
+        let operator: Address = env
             .storage()
             .instance()
-            .get(&DataKey::Config)
+            .get(&StorageKey::MarketOperator)
             .ok_or(Error::NotInitialized)?;
-        config.admin.require_auth();
-        if recipients.is_empty()
-            || recipients.len() != amounts.len()
-            || recipients.len() > MAX_RECIPIENTS
-        {
-            return Err(Error::InvalidRecipients);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+
+        if caller != operator && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        if fee_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let ratios: SplitRatios = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SplitRatios)
+            .ok_or(Error::NotInitialized)?;
+
+        let protocol_recipient: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ProtocolRecipient)
+            .ok_or(Error::NotInitialized)?;
+        let lp_pool_recipient: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::LpPoolRecipient)
+            .ok_or(Error::NotInitialized)?;
+
+        let issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::InvoiceIssuer(invoice_id.clone()))
+            .ok_or(Error::IssuerNotFound)?;
+
+        let protocol_amount = (fee_amount * (ratios.protocol_bps as i128)) / 10_000;
+        let issuer_amount = (fee_amount * (ratios.issuer_bps as i128)) / 10_000;
+        let lp_pool_amount = fee_amount - protocol_amount - issuer_amount;
+
+        let splits = SplitAmounts {
+            protocol_amount,
+            issuer_amount,
+            lp_pool_amount,
+        };
+
+        let treasury = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TreasuryBalance)
+            .unwrap_or(0i128);
+        env.storage().instance().set(
+            &StorageKey::TreasuryBalance,
+            &treasury
+                .checked_add(fee_amount)
+                .ok_or(Error::InvalidAmount)?,
+        );
+
+        // Update accumulated balances
+        Self::add_balance(&env, &protocol_recipient, protocol_amount);
+        Self::add_balance(&env, &issuer, issuer_amount);
+        Self::add_balance(&env, &lp_pool_recipient, lp_pool_amount);
+
+        events::fee_collected(&env, &invoice_id, fee_amount, &splits);
+
+        Ok(splits)
+    }
+
+    /// Admin-only batch distribution. Each recipient is paid once and the
+    /// operation is recorded under a monotonically increasing epoch.
+    pub fn distribute(
+        env: Env,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> Result<u64, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if recipients.len() != amounts.len() || recipients.is_empty() {
+            return Err(Error::InvalidAmount);
         }
         let mut total = 0i128;
         for amount in amounts.iter() {
             if amount <= 0 {
                 return Err(Error::InvalidAmount);
             }
-            total = total.checked_add(amount).ok_or(Error::Overflow)?;
+            total = total.checked_add(amount).ok_or(Error::InvalidAmount)?;
         }
-        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
-        if total > balance {
-            return Err(Error::InsufficientBalance);
-        }
-        let token = soroban_sdk::token::Client::new(&env, &config.token);
-        for i in 0..recipients.len() {
-            token.transfer(
-                &env.current_contract_address(),
-                &recipients.get(i).unwrap(),
-                &amounts.get(i).unwrap(),
-            );
-        }
-        let epoch: u64 = env
+        let balance = env
             .storage()
             .instance()
-            .get(&DataKey::Epoch)
-            .unwrap_or(0)
+            .get(&StorageKey::TreasuryBalance)
+            .unwrap_or(0i128);
+        if total > balance {
+            return Err(Error::InvalidAmount);
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        let client = token::Client::new(&env, &token_addr);
+        for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
+            client.transfer(&env.current_contract_address(), &recipient, &amount);
+        }
+        let epoch = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DistributionEpoch)
+            .unwrap_or(0u64)
             .checked_add(1)
-            .ok_or(Error::Overflow)?;
-        env.storage().instance().set(&DataKey::Epoch, &epoch);
+            .ok_or(Error::InvalidAmount)?;
         env.storage()
             .instance()
-            .set(&DataKey::Balance, &(balance - total));
+            .set(&StorageKey::DistributionEpoch, &epoch);
+        env.storage()
+            .instance()
+            .set(&StorageKey::TreasuryBalance, &(balance - total));
         let record = DistributionRecord {
             epoch,
-            recipients: recipients.clone(),
-            amounts: amounts.clone(),
-            total,
+            total_amount: total,
+            timestamp: env.ledger().timestamp(),
         };
         env.storage()
-            .instance()
-            .set(&DataKey::Distribution(epoch), &record);
+            .persistent()
+            .set(&StorageKey::Distribution(epoch), &record);
         env.events().publish(
-            (Symbol::new(&env, "FeeDistributed"), epoch),
-            (recipients, amounts, total),
+            (soroban_sdk::Symbol::new(&env, "FeeDistributed"), epoch),
+            (total, recipients.len()),
         );
         Ok(epoch)
     }
 
-    pub fn get_distribution(env: Env, epoch: u64) -> Result<DistributionRecord, Error> {
+    pub fn treasury_balance(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&DataKey::Distribution(epoch))
-            .ok_or(Error::NotInitialized)
+            .get(&StorageKey::TreasuryBalance)
+            .unwrap_or(0)
+    }
+
+    pub fn distribution_history(env: Env, epoch: u64) -> Result<DistributionRecord, Error> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Distribution(epoch))
+            .ok_or(Error::NoBalanceToWithdraw)
+    }
+
+    fn add_balance(env: &Env, recipient: &Address, amount: i128) {
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::Balance(recipient.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Balance(recipient.clone()), &(current + amount));
+
+        let total = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::TotalAccumulated(recipient.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &StorageKey::TotalAccumulated(recipient.clone()),
+            &(total + amount),
+        );
+    }
+
+    pub fn withdraw(env: Env, recipient: Address) -> Result<i128, Error> {
+        recipient.require_auth();
+
+        let balance = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::Balance(recipient.clone()))
+            .unwrap_or(0);
+
+        if balance <= 0 {
+            return Err(Error::NoBalanceToWithdraw);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Balance(recipient.clone()), &0i128);
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Token)
+            .ok_or(Error::NotInitialized)?;
+
+        let client = token::Client::new(&env, &token_addr);
+        let contract_balance = client.balance(&env.current_contract_address());
+        if contract_balance >= balance {
+            client.transfer(&env.current_contract_address(), &recipient, &balance);
+        }
+
+        events::fee_withdrawn(&env, &recipient, balance);
+
+        Ok(balance)
+    }
+
+    pub fn get_balance(env: Env, recipient: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::Balance(recipient))
+            .unwrap_or(0)
+    }
+
+    pub fn get_total_accumulated(env: Env, recipient: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::TotalAccumulated(recipient))
+            .unwrap_or(0)
     }
 }

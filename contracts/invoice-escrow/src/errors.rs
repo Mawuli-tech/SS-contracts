@@ -120,7 +120,24 @@ pub enum Error {
     /// Settlement fee exceeds the protocol's 10% safety ceiling.
     FeeTooHigh = 55,
     /// A registered invoice has reached its configured unique-investor cap.
-    MaxInvestorsReached = 55,
+    MaxInvestorsReached = 57,
     /// Investor cap is outside the supported range.
     InvalidMaxInvestors = 56,
+    /// The requested payment token is outside the escrow's accepted token set.
+    TokenNotAccepted = 58,
+    /// The same administrator cannot propose and approve one settlement.
+    SameAdminApproval = 59,
+    /// No settlement proposal exists for the invoice.
+    SettlementNotProposed = 60,
+    /// Funding thresholds are invalid (must satisfy
+    /// `0 < min <= funding_target <= max`).
+    InvalidFundingThreshold = 61,
+    /// Total raised is below the invoice's minimum funding threshold, so the
+    /// proceeds cannot be released to the issuer yet.
+    FundingThresholdNotReached = 62,
+    /// Investment would push the total raised above the maximum funding
+    /// threshold (invoice funding capacity is exhausted).
+    MaxFundingThresholdExceeded = 63,
+    /// Wallet's secondary-market buy limit for the current window was exceeded.
+    BuyLimitExceeded = 64,
 }

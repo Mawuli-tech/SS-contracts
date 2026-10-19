@@ -4,7 +4,7 @@ use soroban_sdk::{Address, BytesN, Env, Symbol};
 
 use crate::types::{
     CategoryFeeSchedule, Config, DisputeData, EmergencyApprovals, EscrowData, InstallmentMilestone,
-    InvoiceCategory, InvoiceData, MultiSigConfig, StorageKey,
+    InvoiceCategory, InvoiceData, MultiSigConfig, SettlementProposal, StorageKey,
 };
 
 /// Ledgers below which a persistent entry's TTL is extended (~7 days at 5s/ledger).
@@ -18,7 +18,6 @@ pub fn bump_persistent(env: &Env, key: &StorageKey) {
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD, MIN_TTL_EXTEND);
 }
-
 
 /// Load contract config from instance storage, bumping instance TTL.
 pub fn get_config(env: &Env) -> Option<Config> {
@@ -67,11 +66,7 @@ pub fn has_escrow(env: &Env, inv_id: Symbol) -> bool {
 
 /// Remove escrow data and all per-funder contribution records for an invoice from
 /// persistent storage (storage footprint cleanup).
-pub fn remove_escrow_state(
-    env: &Env,
-    inv_id: Symbol,
-    funders: &soroban_sdk::Vec<Address>,
-) {
+pub fn remove_escrow_state(env: &Env, inv_id: Symbol, funders: &soroban_sdk::Vec<Address>) {
     for funder in funders.iter() {
         env.storage()
             .persistent()
@@ -100,11 +95,7 @@ pub fn set_nonce(env: &Env, buyer: &Address, nonce: u64) {
 }
 
 /// Get the amount funded by a specific funder for an invoice.
-pub fn get_funder_amount(
-    env: &Env,
-    inv_id: Symbol,
-    funder: &Address,
-) -> i128 {
+pub fn get_funder_amount(env: &Env, inv_id: Symbol, funder: &Address) -> i128 {
     let key = StorageKey::FunderAmount(inv_id, funder.clone());
     let amount = env.storage().persistent().get(&key).unwrap_or(0);
     if env.storage().persistent().has(&key) {
@@ -114,12 +105,7 @@ pub fn get_funder_amount(
 }
 
 /// Set the amount funded by a specific funder for an invoice.
-pub fn set_funder_amount(
-    env: &Env,
-    inv_id: Symbol,
-    funder: &Address,
-    amount: i128,
-) {
+pub fn set_funder_amount(env: &Env, inv_id: Symbol, funder: &Address, amount: i128) {
     let key = StorageKey::FunderAmount(inv_id, funder.clone());
     if amount == 0 {
         env.storage().persistent().remove(&key);
@@ -150,9 +136,7 @@ pub fn set_whitelisted(env: &Env, buyer: &Address, allowed: bool) {
     }
 }
 
-// ?? Funding invoice (BytesN<32>) storage for position management ???????
-
-use soroban_sdk::BytesN;
+// ── Funding invoice (BytesN<32>) storage for position management ───────────
 
 use crate::types::FundingInvoice;
 
@@ -230,6 +214,27 @@ pub fn set_invoice_record(env: &Env, inv_id: &BytesN<32>, data: &InvoiceData) {
     let key = StorageKey::InvoiceRecord(inv_id.clone());
     env.storage().persistent().set(&key, data);
     bump_persistent(env, &key);
+}
+
+pub fn get_settlement_proposal(env: &Env, inv_id: &BytesN<32>) -> Option<SettlementProposal> {
+    let key = StorageKey::SettlementProposal(inv_id.clone());
+    let proposal = env.storage().persistent().get(&key);
+    if proposal.is_some() {
+        bump_persistent(env, &key);
+    }
+    proposal
+}
+
+pub fn set_settlement_proposal(env: &Env, inv_id: &BytesN<32>, proposal: &SettlementProposal) {
+    let key = StorageKey::SettlementProposal(inv_id.clone());
+    env.storage().persistent().set(&key, proposal);
+    bump_persistent(env, &key);
+}
+
+pub fn remove_settlement_proposal(env: &Env, inv_id: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::SettlementProposal(inv_id.clone()));
 }
 
 /// Check if an invoice record exists for BytesN<32>.
@@ -399,7 +404,9 @@ pub fn set_max_investors(env: &Env, count: u32) {
 // ── Issue #443: Pending param change storage ─────────────────────────────────
 
 pub fn get_pending_param_change(env: &Env) -> Option<crate::types::PendingParamChange> {
-    env.storage().instance().get(&StorageKey::PendingParamChange)
+    env.storage()
+        .instance()
+        .get(&StorageKey::PendingParamChange)
 }
 
 pub fn set_pending_param_change(env: &Env, proposal: &crate::types::PendingParamChange) {
@@ -409,7 +416,9 @@ pub fn set_pending_param_change(env: &Env, proposal: &crate::types::PendingParam
 }
 
 pub fn clear_pending_param_change(env: &Env) {
-    env.storage().instance().remove(&StorageKey::PendingParamChange);
+    env.storage()
+        .instance()
+        .remove(&StorageKey::PendingParamChange);
 }
 
 // ── Issue #469: Batch TTL extension for off-chain keeper bots ─────────────────
@@ -436,7 +445,11 @@ pub fn batch_extend_ttl(env: &Env, keys: &soroban_sdk::Vec<StorageKey>) {
 /// events have been emitted.
 ///
 /// Returns the number of storage keys removed.
-pub fn compact_invoice_storage(env: &Env, inv_id: &Symbol, funder_addresses: &soroban_sdk::Vec<Address>) -> u32 {
+pub fn compact_invoice_storage(
+    env: &Env,
+    inv_id: &Symbol,
+    funder_addresses: &soroban_sdk::Vec<Address>,
+) -> u32 {
     let mut removed = 0u32;
 
     // Remove per-funder contribution records
