@@ -12,7 +12,6 @@ members = [
     "contracts/investment-limit",
     "contracts/investor-notifications",
     "contracts/yield-accrual",
-    "contracts/invoice-maturity-reminder",
     "contracts/interest-rate-oracle",
     "contracts/fraction-transfer-restriction",
 ]
